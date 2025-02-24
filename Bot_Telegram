@@ -1,0 +1,261 @@
+from telegram import Update, ReplyKeyboardMarkup, InputFile
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler,
+)
+import sqlite3
+from datetime import datetime
+import os
+import csv
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+
+# Configurações
+TOKEN = "7781334700:AAE7buocWIs0MJVoSchWq1NHe8Vg_XF_xeM"
+DB_NAME = os.path.join(os.path.dirname(__file__), "gastos.db")  # Banco na mesma pasta do script
+
+# Estados da conversa
+AGUARDANDO_NOME, AGUARDANDO_VALOR, AGUARDANDO_OBSERVACAO = range(3)
+
+# Inicialização do Banco de Dados
+def criar_banco():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS transacoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT,
+            tipo TEXT,
+            valor REAL,
+            observacao TEXT,
+            data TEXT,
+            ultima_atualizacao TEXT
+        )
+    ''')
+
+    cursor.execute("PRAGMA table_info(transacoes)")
+    colunas = [info[1] for info in cursor.fetchall()]
+    
+    for coluna in ['nome', 'ultima_atualizacao']:
+        if coluna not in colunas:
+            cursor.execute(f'ALTER TABLE transacoes ADD COLUMN {coluna} TEXT')
+
+    conn.commit()
+    conn.close()
+
+criar_banco()
+
+# Funções Auxiliares
+def ultima_atualizacao():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT MAX(ultima_atualizacao) FROM transacoes')
+    resultado = cursor.fetchone()[0]
+    conn.close()
+    return resultado if resultado else "1970-01-01 00:00:00"
+
+def salvar_transacao(nome, tipo, valor, observacao):
+    data = datetime.now().strftime("%d/%m/%Y %H:%M")
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO transacoes (nome, tipo, valor, observacao, data, ultima_atualizacao)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (nome, tipo, valor, observacao, data, data))
+    conn.commit()
+    conn.close()
+
+# Geração de Relatórios
+def gerar_relatorio(tipo):
+    nome_arquivo = os.path.join(os.path.dirname(__file__), f"relatorio_gastos.{tipo}")
+    ultima_db = ultima_atualizacao()
+
+    if os.path.exists(nome_arquivo):
+        ultima_arquivo = datetime.fromtimestamp(os.path.getmtime(nome_arquivo)).strftime("%d/%m/%Y %H:%M")
+        if ultima_db <= ultima_arquivo:
+            return nome_arquivo
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM transacoes')
+    transacoes = cursor.fetchall()
+    conn.close()
+
+    if tipo == "pdf":
+        c = canvas.Canvas(nome_arquivo, pagesize=letter)
+        y = 750
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(50, 780, "Relatório de Gastos Detalhado")
+        c.setFont("Helvetica", 12)
+        
+        for transacao in transacoes:
+            _, nome, tipo_trans, valor, obs, data, _ = transacao
+            c.drawString(50, y, f"{data} | {nome} | {tipo_trans.upper()} | R$ {valor:.2f} | {obs}")
+            y -= 20
+            if y < 50:
+                c.showPage()
+                y = 750
+        c.save()
+
+    elif tipo == "csv":
+        with open(nome_arquivo, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Data', 'Nome', 'Tipo', 'Valor', 'Observação'])
+            for transacao in transacoes:
+                _, nome, tipo_trans, valor, obs, data, _ = transacao
+                writer.writerow([data, nome, tipo_trans, valor, obs])
+
+    return nome_arquivo
+
+# Handlers do Telegram
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    teclado = [["💰 Registrar Entrada", "💸 Registrar Saída"], ["📊 Ver Resumo", "📁 Gerar Relatórios"]]
+    await update.message.reply_text(
+        "📈 *Gestor Financeiro Levante*\nEscolha uma opção no seu teclado:",
+        reply_markup=ReplyKeyboardMarkup(teclado, one_time_keyboard=True),
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+async def registrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tipo = "entrada" if "Entrada" in update.message.text else "saida"
+    context.user_data["tipo"] = tipo
+    await update.message.reply_text(
+        "👤 Digite o seu nome:",
+        reply_markup=ReplyKeyboardMarkup([["❌ Cancelar"]], one_time_keyboard=True)
+    )
+    return AGUARDANDO_NOME
+
+async def receber_nome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Cancelar":
+        return await cancelar(update, context)
+    
+    context.user_data["nome"] = update.message.text
+    await update.message.reply_text(
+        f"🔢 Digite o valor para {context.user_data['tipo']} (ex: 150.50):",
+        reply_markup=ReplyKeyboardMarkup([["❌ Cancelar"]], one_time_keyboard=True)
+    )
+    return AGUARDANDO_VALOR
+
+async def receber_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Cancelar":
+        return await cancelar(update, context)
+    
+    try:
+        valor = float(update.message.text.replace(',', '.'))
+        context.user_data["valor"] = valor
+        await update.message.reply_text(
+            "📝 Adicione uma observação (ex: Mercado):",
+            reply_markup=ReplyKeyboardMarkup([["❌ Cancelar"]], one_time_keyboard=True)
+        )
+        return AGUARDANDO_OBSERVACAO
+    except:
+        await update.message.reply_text("❌ Valor inválido! Use números (ex: 50 ou 100.50)")
+        return AGUARDANDO_VALOR
+
+async def receber_observacao(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Cancelar":
+        return await cancelar(update, context)
+    
+    observacao = update.message.text
+    salvar_transacao(
+        context.user_data["nome"],
+        context.user_data["tipo"],
+        context.user_data["valor"],
+        observacao
+    )
+    await update.message.reply_text(
+        f"✅ Registro salvo!\n"
+        f"👤 Nome: {context.user_data['nome']}\n"
+        f"💼 Tipo: {context.user_data['tipo'].title()}\n"
+        f"💵 Valor: R$ {context.user_data['valor']:.2f}\n"
+        f"📝 Observação: {observacao}"
+    )
+    await start(update, context)
+    return ConversationHandler.END
+
+async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT SUM(valor) FROM transacoes WHERE tipo = "entrada"')
+    entradas = cursor.fetchone()[0] or 0
+    
+    cursor.execute('SELECT SUM(valor) FROM transacoes WHERE tipo = "saida"')
+    saidas = cursor.fetchone()[0] or 0
+    
+    await update.message.reply_text(
+        f"📈 *Resumo Financeiro*\n\n"
+        f"💰 Entradas: R$ {entradas:.2f}\n"
+        f"💸 Saídas: R$ {saidas:.2f}\n"
+        f"💹 Saldo: R$ {entradas - saidas:.2f}",
+        parse_mode="Markdown"
+    )
+
+async def relatorios(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    teclado = [["📄 Relatório PDF", "📝 Relatório CSV"], ["🏠 Início"]]
+    await update.message.reply_text(
+        "📁 Escolha o formato do relatório:",
+        reply_markup=ReplyKeyboardMarkup(teclado, one_time_keyboard=True)
+    )
+
+async def enviar_relatorio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tipo = "pdf" if "PDF" in update.message.text else "csv"
+    arquivo = gerar_relatorio(tipo)
+    
+    with open(arquivo, 'rb') as f:
+        await update.message.reply_document(
+            document=InputFile(f),
+            caption=f"📊 Relatório de Gastos ({tipo.upper()})"
+        )
+
+async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data:
+        context.user_data.clear()
+    await update.message.reply_text(
+        "❌ Operação cancelada. Clique em 🏠 Início para recomeçar.",
+        reply_markup=ReplyKeyboardMarkup([["🏠 Início"]], one_time_keyboard=True)
+    )
+    return ConversationHandler.END
+
+async def inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+    return ConversationHandler.END
+
+# Configuração Principal
+def main():
+    app = Application.builder().token(TOKEN).build()
+
+    # Conversation Handler
+    conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex(r"^(💰 Registrar Entrada|💸 Registrar Saída)$"), registrar),
+            CommandHandler("start", start)
+        ],
+        states={
+            AGUARDANDO_NOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_nome)],
+            AGUARDANDO_VALOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_valor)],
+            AGUARDANDO_OBSERVACAO: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_observacao)]
+        },
+        fallbacks=[
+            MessageHandler(filters.Regex(r"^❌ Cancelar$"), cancelar),
+            CommandHandler("cancelar", cancelar)
+        ]
+    )
+
+    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Regex(r"^📊 Ver Resumo$"), resumo))
+    app.add_handler(MessageHandler(filters.Regex(r"^📁 Gerar Relatórios$"), relatorios))
+    app.add_handler(MessageHandler(filters.Regex(r"^(📄 Relatório PDF|📝 Relatório CSV)$"), enviar_relatorio))
+    app.add_handler(MessageHandler(filters.Regex(r"^🏠 Início$"), inicio))
+
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
