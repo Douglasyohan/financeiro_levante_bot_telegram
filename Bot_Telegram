@@ -15,7 +15,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
 # Configurações
-TOKEN = "7781334700:AAE7buocWIs0MJVoSchWq1NHe8Vg_XF_xeM"
+TOKEN = "SEUTOKETN"
 DB_NAME = os.path.join(os.path.dirname(__file__), "gastos.db")  # Banco na mesma pasta do script
 
 # Estados da conversa
